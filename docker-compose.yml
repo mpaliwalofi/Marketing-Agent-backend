@@ -1,0 +1,56 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: sia-postgres
+    restart: always
+    environment:
+      POSTGRES_DB: sia_database
+      POSTGRES_USER: sia_user
+      POSTGRES_PASSWORD: sia_password
+    ports:
+      - "5433:5432"  # Using 5433 to avoid conflict with local PostgreSQL
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sia_user -d sia_database"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  web:
+    build: .
+    container_name: sia-backend
+    restart: always
+    command: >
+      sh -c "
+        echo 'Waiting for database...' &&
+        sleep 5 &&
+        python manage.py migrate &&
+        python manage.py collectstatic --noinput &&
+        echo 'Starting server...' &&
+        gunicorn config.wsgi:application --bind 0.0.0.0:8000 --reload --log-level debug
+      "
+    volumes:
+      - .:/app
+    ports:
+      - "8000:8000"
+    environment:
+      DJANGO_SETTINGS_MODULE: config.settings.development
+      DEBUG: "True"
+      SECRET_KEY: django-insecure-local-dev-key-12345
+      ALLOWED_HOSTS: localhost,127.0.0.1,0.0.0.0
+      DB_NAME: sia_database
+      DB_USER: sia_user
+      DB_PASSWORD: sia_password
+      DB_HOST: db
+      DB_PORT: "5432"
+      GEMINI_API_KEY: AIzaSyDVl5x6ljgQ-JgJXrecAU8MVVSgbkgfcNo
+      CORS_ALLOWED_ORIGINS: http://localhost:3000
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
