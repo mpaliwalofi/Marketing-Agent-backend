@@ -23,10 +23,14 @@ INSTALLED_APPS = [
     # Local apps
     'apps.waitlist',
     'apps.chatbot',
+    'apps.tenants',
+    'apps.auth_app',
 ]
 
 MIDDLEWARE = [
     'corsheaders.middleware.CorsMiddleware',
+    'apps.auth_app.middleware.SupabaseAuthMiddleware',
+    'apps.auth_app.middleware.TenantMiddleware',
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
@@ -94,7 +98,34 @@ REST_FRAMEWORK = {
     ],
     'DEFAULT_THROTTLE_RATES': {
         'anon': '100/hour',
+        'tenant': '60/minute',
+    },
+    'DEFAULT_AUTHENTICATION_CLASSES': [
+        'apps.auth_app.authentication.SupabaseJWTAuthentication',  # Try JWT first
+        'apps.tenants.authentication.TenantAPIKeyAuthentication',  # Then API key
+    ],
+}
+
+# Cache configuration (for rate limiting)
+CACHES = {
+    'default': {
+        'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
+        'LOCATION': 'unique-snowflake',
     }
+}
+
+# Supabase Configuration
+SUPABASE_URL = os.getenv('SUPABASE_URL', '')
+SUPABASE_ANON_KEY = os.getenv('SUPABASE_ANON_KEY', '')
+SUPABASE_SERVICE_KEY = os.getenv('SUPABASE_SERVICE_KEY', '')
+SUPABASE_JWT_SECRET = os.getenv('SUPABASE_JWT_SECRET', '')
+
+# Agent Configuration
+AGENT_CONFIG = {
+    'MARK_AGENT_TIMEOUT': int(os.getenv('MARK_AGENT_TIMEOUT', '30')),
+    'HR_AGENT_TIMEOUT': int(os.getenv('HR_AGENT_TIMEOUT', '30')),
+    'DEFAULT_RATE_LIMIT': int(os.getenv('DEFAULT_RATE_LIMIT', '60')),
+    'DEFAULT_MONTHLY_QUOTA': int(os.getenv('DEFAULT_MONTHLY_QUOTA', '1000')),
 }
 
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
