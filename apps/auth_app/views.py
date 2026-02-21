@@ -1,480 +1,217 @@
 """
-Views for authentication endpoints.
+Authentication views — register, login, logout, refresh, profile, password reset.
 """
 
+import logging
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
-from rest_framework.views import APIView
-from django.contrib.auth import login, logout
-from django.db import transaction
-import logging
 
-from .models import SupabaseUser, Invitation
+from .models import UserProfile
 from .serializers import (
     RegisterSerializer, LoginSerializer, TokenRefreshSerializer,
-    UserProfileSerializer, UserUpdateSerializer, InvitationSerializer,
-    AcceptInvitationSerializer
+    UserProfileSerializer, ProfileUpdateSerializer,
 )
-from .services import AuthService, UserPermissionService
-from .permissions import IsSupabaseUser, IsTenantAdmin, HasTenantAccess
-from .authentication import SupabaseJWTAuthentication
+from .services import AuthService
 
 logger = logging.getLogger(__name__)
 
 
-# =============================================================================
-# Registration & Login
-# =============================================================================
+# ------------------------------------------------------------------ #
+# Registration & Login                                                  #
+# ------------------------------------------------------------------ #
 
-@api_view(['POST'])
+@api_view(["POST"])
 @permission_classes([AllowAny])
 def register(request):
     """
-    Register a new user.
-    
-    Request body:
-    {
-        "email": "user@example.com",
-        "password": "securepassword",
-        "first_name": "John",
-        "last_name": "Doe",
-        "tenant_id": "optional-tenant-id"
-    }
+    Register a new user account.
+
+    Body: { "email", "password", "full_name" (optional) }
+    Supabase will send a confirmation email; the user must verify before logging in.
     """
     serializer = RegisterSerializer(data=request.data)
     if not serializer.is_valid():
-        return Response({
-            'success': False,
-            'error': 'Invalid data',
-            'details': serializer.errors
-        }, status=status.HTTP_400_BAD_REQUEST)
-    
+        return Response(
+            {"success": False, "errors": serializer.errors},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
     data = serializer.validated_data
-    
     success, result = AuthService.register_user(
-        email=data['email'],
-        password=data['password'],
-        tenant_id=data.get('tenant_id'),
-        first_name=data.get('first_name'),
-        last_name=data.get('last_name')
+        email=data["email"],
+        password=data["password"],
+        full_name=data.get("full_name", ""),
     )
-    
+
     if not success:
-        return Response({
-            'success': False,
-            'error': result.get('error', 'Registration failed')
-        }, status=status.HTTP_400_BAD_REQUEST)
-    
-    return Response({
-        'success': True,
-        'message': 'Registration successful. Please check your email to confirm your account.',
-        'data': {
-            'user_id': result.get('user_id'),
-            'email': result.get('email')
-        }
-    }, status=status.HTTP_201_CREATED)
+        return Response(
+            {"success": False, "error": result.get("error", "Registration failed")},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    return Response(
+        {"success": True, "message": result["message"]},
+        status=status.HTTP_201_CREATED,
+    )
 
 
-@api_view(['POST'])
+@api_view(["POST"])
 @permission_classes([AllowAny])
 def login(request):
     """
-    Login a user.
-    
-    Request body:
-    {
-        "email": "user@example.com",
-        "password": "securepassword"
-    }
-    
-    Response:
-    {
-        "success": true,
-        "data": {
-            "access_token": "...",
-            "refresh_token": "...",
-            "expires_in": 3600,
-            "user": {
-                "id": "...",
-                "email": "...",
-                "role": "...",
-                "tenant_id": "..."
-            }
-        }
-    }
+    Login with email + password.
+
+    Body: { "email", "password" }
+    Returns: { access_token, refresh_token, expires_in, user }
     """
     serializer = LoginSerializer(data=request.data)
     if not serializer.is_valid():
-        return Response({
-            'success': False,
-            'error': 'Invalid data',
-            'details': serializer.errors
-        }, status=status.HTTP_400_BAD_REQUEST)
-    
+        return Response(
+            {"success": False, "errors": serializer.errors},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
     data = serializer.validated_data
-    
     success, result = AuthService.login_user(
-        email=data['email'],
-        password=data['password']
+        email=data["email"], password=data["password"]
     )
-    
+
     if not success:
-        return Response({
-            'success': False,
-            'error': result.get('error', 'Login failed')
-        }, status=status.HTTP_401_UNAUTHORIZED)
-    
-    return Response({
-        'success': True,
-        'message': 'Login successful',
-        'data': result
-    })
+        return Response(
+            {"success": False, "error": result.get("error", "Login failed")},
+            status=status.HTTP_401_UNAUTHORIZED,
+        )
+
+    return Response({"success": True, "data": result})
 
 
-@api_view(['POST'])
+@api_view(["POST"])
 @permission_classes([AllowAny])
 def refresh_token(request):
     """
-    Refresh an access token using a refresh token.
-    
-    Request body:
-    {
-        "refresh_token": "..."
-    }
+    Exchange a refresh token for a new access token.
+
+    Body: { "refresh_token" }
     """
     serializer = TokenRefreshSerializer(data=request.data)
     if not serializer.is_valid():
-        return Response({
-            'success': False,
-            'error': 'Invalid data',
-            'details': serializer.errors
-        }, status=status.HTTP_400_BAD_REQUEST)
-    
-    success, result = AuthService.refresh_token(serializer.validated_data['refresh_token'])
-    
+        return Response(
+            {"success": False, "errors": serializer.errors},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    success, result = AuthService.refresh_token(serializer.validated_data["refresh_token"])
     if not success:
-        return Response({
-            'success': False,
-            'error': result.get('error', 'Token refresh failed')
-        }, status=status.HTTP_401_UNAUTHORIZED)
-    
+        return Response(
+            {"success": False, "error": result.get("error", "Token refresh failed")},
+            status=status.HTTP_401_UNAUTHORIZED,
+        )
+
     return Response({
-        'success': True,
-        'data': {
-            'access_token': result.get('access_token'),
-            'refresh_token': result.get('refresh_token'),
-            'expires_in': result.get('expires_in')
-        }
+        "success": True,
+        "data": {
+            "access_token": result.get("access_token"),
+            "refresh_token": result.get("refresh_token"),
+            "expires_in": result.get("expires_in"),
+        },
     })
 
 
-@api_view(['POST'])
-@permission_classes([IsSupabaseUser])
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
 def logout(request):
     """
-    Logout the current user.
-    Requires authentication.
+    Invalidate the current Supabase session.
+    The client must also discard its local tokens.
     """
-    supabase_user = request.supabase_user
-    
-    AuthService.logout_user(supabase_user)
-    
+    # Extract the raw token from the Authorization header
+    auth_header = request.META.get("HTTP_AUTHORIZATION", "")
+    access_token = auth_header[7:].strip() if auth_header.startswith("Bearer ") else ""
+
+    AuthService.logout_user(access_token)
+    return Response({"success": True, "message": "Logged out successfully."})
+
+
+# ------------------------------------------------------------------ #
+# Session                                                               #
+# ------------------------------------------------------------------ #
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def validate_session(request):
+    """Return minimal user info confirming the token is still valid."""
+    profile: UserProfile = request.user
     return Response({
-        'success': True,
-        'message': 'Logout successful'
+        "success": True,
+        "data": {
+            "valid": True,
+            "user": {
+                "id": str(profile.id),
+                "email": profile.email,
+                "role": profile.role,
+                "can_access_mark": profile.can_access_mark,
+                "can_access_hr": profile.can_access_hr,
+            },
+        },
     })
 
 
-# =============================================================================
-# User Profile
-# =============================================================================
+# ------------------------------------------------------------------ #
+# Profile                                                               #
+# ------------------------------------------------------------------ #
 
-@api_view(['GET'])
-@permission_classes([IsSupabaseUser])
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
 def profile(request):
-    """
-    Get current user profile.
-    """
-    supabase_user = request.supabase_user
-    
-    serializer = UserProfileSerializer(supabase_user)
-    
-    # Add accessible agents
-    data = serializer.data
-    data['accessible_agents'] = UserPermissionService.get_accessible_agents(supabase_user)
-    
-    return Response({
-        'success': True,
-        'data': data
-    })
+    """Return the authenticated user's full profile."""
+    serializer = UserProfileSerializer(request.user)
+    return Response({"success": True, "data": serializer.data})
 
 
-@api_view(['PUT', 'PATCH'])
-@permission_classes([IsSupabaseUser])
+@api_view(["PATCH"])
+@permission_classes([IsAuthenticated])
 def update_profile(request):
     """
-    Update current user profile.
+    Update editable profile fields.
+
+    Body (all optional): { "full_name", "phone", "avatar_url" }
     """
-    supabase_user = request.supabase_user
-    
-    serializer = UserUpdateSerializer(supabase_user, data=request.data, partial=True)
-    if not serializer.is_valid():
-        return Response({
-            'success': False,
-            'error': 'Invalid data',
-            'details': serializer.errors
-        }, status=status.HTTP_400_BAD_REQUEST)
-    
-    serializer.save()
-    
-    return Response({
-        'success': True,
-        'message': 'Profile updated',
-        'data': UserProfileSerializer(supabase_user).data
-    })
-
-
-# =============================================================================
-# Agent Access
-# =============================================================================
-
-@api_view(['GET'])
-@permission_classes([IsSupabaseUser])
-def agent_access(request):
-    """
-    Get agent access information for the current user.
-    """
-    supabase_user = request.supabase_user
-    tenant = supabase_user.tenant
-    
-    access_info = {
-        'user': {
-            'id': str(supabase_user.id),
-            'email': supabase_user.email,
-            'role': supabase_user.role
-        },
-        'tenant': {
-            'id': str(tenant.tenant_id) if tenant else None,
-            'name': tenant.name if tenant else None,
-            'subscribed_agents': tenant.subscribed_agents if tenant else None,
-            'status': tenant.status if tenant else None
-        } if tenant else None,
-        'access': {
-            'mark': supabase_user.has_agent_access('mark'),
-            'hr': supabase_user.has_agent_access('hr')
-        },
-        'permissions': {
-            'is_admin': UserPermissionService.is_tenant_admin(supabase_user),
-            'can_manage_users': UserPermissionService.can_manage_users(supabase_user)
-        }
-    }
-    
-    return Response({
-        'success': True,
-        'data': access_info
-    })
-
-
-# =============================================================================
-# Invitations
-# =============================================================================
-
-class InvitationListCreateView(APIView):
-    """List and create invitations."""
-    
-    permission_classes = [IsSupabaseUser, IsTenantAdmin]
-    
-    def get(self, request):
-        """List invitations for the user's tenant."""
-        tenant = request.supabase_user.tenant
-        
-        if not tenant:
-            return Response({
-                'success': False,
-                'error': 'No tenant associated'
-            }, status=status.HTTP_400_BAD_REQUEST)
-        
-        invitations = Invitation.objects.filter(tenant=tenant)
-        
-        # Filter by status
-        status_filter = request.query_params.get('status')
-        if status_filter == 'pending':
-            invitations = invitations.filter(is_used=False)
-        elif status_filter == 'used':
-            invitations = invitations.filter(is_used=True)
-        
-        serializer = InvitationSerializer(invitations, many=True)
-        
-        return Response({
-            'success': True,
-            'data': serializer.data
-        })
-    
-    def post(self, request):
-        """Create a new invitation."""
-        tenant = request.supabase_user.tenant
-        
-        if not tenant:
-            return Response({
-                'success': False,
-                'error': 'No tenant associated'
-            }, status=status.HTTP_400_BAD_REQUEST)
-        
-        serializer = InvitationSerializer(data=request.data)
-        if not serializer.is_valid():
-            return Response({
-                'success': False,
-                'error': 'Invalid data',
-                'details': serializer.errors
-            }, status=status.HTTP_400_BAD_REQUEST)
-        
-        success, result = AuthService.create_invitation(
-            tenant=tenant,
-            email=serializer.validated_data['email'],
-            invited_by=request.supabase_user,
-            role=serializer.validated_data.get('role', 'user')
-        )
-        
-        if not success:
-            return Response({
-                'success': False,
-                'error': result.get('error', 'Failed to create invitation')
-            }, status=status.HTTP_400_BAD_REQUEST)
-        
-        return Response({
-            'success': True,
-            'message': 'Invitation created',
-            'data': result
-        }, status=status.HTTP_201_CREATED)
-
-
-@api_view(['POST'])
-@permission_classes([IsSupabaseUser])
-def accept_invitation(request):
-    """
-    Accept an invitation to join a tenant.
-    
-    Request body:
-    {
-        "token": "invitation-token"
-    }
-    """
-    serializer = AcceptInvitationSerializer(data=request.data)
-    if not serializer.is_valid():
-        return Response({
-            'success': False,
-            'error': 'Invalid data',
-            'details': serializer.errors
-        }, status=status.HTTP_400_BAD_REQUEST)
-    
-    success, result = AuthService.accept_invitation(
-        token=serializer.validated_data['token'],
-        supabase_user=request.supabase_user
+    serializer = ProfileUpdateSerializer(
+        request.user, data=request.data, partial=True
     )
-    
-    if not success:
-        return Response({
-            'success': False,
-            'error': result.get('error', 'Failed to accept invitation')
-        }, status=status.HTTP_400_BAD_REQUEST)
-    
+    if not serializer.is_valid():
+        return Response(
+            {"success": False, "errors": serializer.errors},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    serializer.save()
     return Response({
-        'success': True,
-        'message': result.get('message', 'Invitation accepted'),
-        'data': {
-            'tenant_id': result.get('tenant_id'),
-            'role': result.get('role')
-        }
+        "success": True,
+        "message": "Profile updated.",
+        "data": UserProfileSerializer(request.user).data,
     })
 
 
-# =============================================================================
-# Session Validation
-# =============================================================================
+# ------------------------------------------------------------------ #
+# Password reset                                                        #
+# ------------------------------------------------------------------ #
 
-@api_view(['GET'])
-@permission_classes([IsSupabaseUser])
-def validate_session(request):
-    """
-    Validate the current session and return user info.
-    Useful for checking if token is still valid on app load.
-    """
-    supabase_user = request.supabase_user
-    
-    return Response({
-        'success': True,
-        'data': {
-            'valid': True,
-            'user': {
-                'id': str(supabase_user.id),
-                'email': supabase_user.email,
-                'role': supabase_user.role,
-                'tenant_id': str(supabase_user.tenant.tenant_id) if supabase_user.tenant else None
-            }
-        }
-    })
-
-
-# =============================================================================
-# Password Reset
-# =============================================================================
-
-@api_view(['POST'])
+@api_view(["POST"])
 @permission_classes([AllowAny])
 def request_password_reset(request):
     """
-    Request a password reset email.
-    This is handled by Supabase, we just proxy the request.
-    
-    Request body:
-    {
-        "email": "user@example.com"
-    }
+    Trigger a Supabase password-reset email.
+
+    Body: { "email" }
+    Always returns 200 to prevent email enumeration.
     """
-    email = request.data.get('email')
-    
-    if not email:
-        return Response({
-            'success': False,
-            'error': 'Email is required'
-        }, status=status.HTTP_400_BAD_REQUEST)
-    
-    # In production, this would call Supabase to send reset email
-    # For now, just acknowledge
+    email = request.data.get("email", "").strip().lower()
+    if email:
+        AuthService.request_password_reset(email)
+
     return Response({
-        'success': True,
-        'message': 'If an account exists with this email, a password reset link has been sent.'
-    })
-
-
-# =============================================================================
-# Email Verification
-# =============================================================================
-
-@api_view(['POST'])
-@permission_classes([AllowAny])
-def resend_verification_email(request):
-    """
-    Resend email verification link.
-    
-    Request body:
-    {
-        "email": "user@example.com"
-    }
-    """
-    email = request.data.get('email')
-    
-    if not email:
-        return Response({
-            'success': False,
-            'error': 'Email is required'
-        }, status=status.HTTP_400_BAD_REQUEST)
-    
-    # In production, this would call Supabase to resend verification email
-    # For now, instruct user to check their email
-    return Response({
-        'success': True,
-        'message': 'If an account exists with this email, a verification link has been sent. Please check your inbox and spam folder.'
+        "success": True,
+        "message": "If an account with that email exists, a reset link has been sent.",
     })

@@ -1,290 +1,201 @@
 """
-Supabase client configuration and JWT verification.
+Supabase Auth HTTP client.
+
+All token/session management (sign-up, sign-in, sign-out, refresh, JWT
+verification) is delegated to Supabase. Django only stores the user profile.
 """
 
 import os
 import jwt
 import requests
 import logging
-from datetime import datetime, timezone
-from typing import Dict, Optional, Tuple
-from django.conf import settings
-from django.core.cache import cache
+from typing import Dict, Tuple
 
 logger = logging.getLogger(__name__)
 
 
-class SupabaseConfig:
-    """Supabase configuration from environment variables."""
-    
-    SUPABASE_URL = os.getenv('SUPABASE_URL', '')
-    SUPABASE_ANON_KEY = os.getenv('SUPABASE_ANON_KEY', '')
-    SUPABASE_SERVICE_KEY = os.getenv('SUPABASE_SERVICE_KEY', '')
-    SUPABASE_JWT_SECRET = os.getenv('SUPABASE_JWT_SECRET', '')
-    
-    @classmethod
-    def is_configured(cls):
-        """Check if Supabase is properly configured."""
-        return bool(cls.SUPABASE_URL and cls.SUPABASE_ANON_KEY)
-
-
 class SupabaseAuth:
-    """
-    Supabase Authentication client.
-    Handles JWT verification and user authentication.
-    """
-    
+    """Thin wrapper around the Supabase Auth REST API."""
+
     def __init__(self):
-        self.supabase_url = SupabaseConfig.SUPABASE_URL.rstrip('/')
-        self.anon_key = SupabaseConfig.SUPABASE_ANON_KEY
-        self.service_key = SupabaseConfig.SUPABASE_SERVICE_KEY
-        self.jwt_secret = SupabaseConfig.SUPABASE_JWT_SECRET
-        
-        self.auth_url = f"{self.supabase_url}/auth/v1"
-        self.rest_url = f"{self.supabase_url}/rest/v1"
-    
+        self.url = os.getenv("SUPABASE_URL", "").rstrip("/")
+        self.anon_key = os.getenv("SUPABASE_ANON_KEY", "")
+        self.service_key = os.getenv("SUPABASE_SERVICE_KEY", "")
+        self.jwt_secret = os.getenv("SUPABASE_JWT_SECRET", "")
+        self.auth_url = f"{self.url}/auth/v1"
+
+    # ------------------------------------------------------------------ #
+    # JWT verification                                                      #
+    # ------------------------------------------------------------------ #
+
     def verify_jwt(self, token: str) -> Tuple[bool, Dict]:
         """
-        Verify a Supabase JWT token.
-        
-        Supports:
-        - HS256 (symmetric) - verify with JWT_SECRET locally
-        - ES256 (asymmetric) - verify via Supabase API (requires public key)
-        - RS256 (asymmetric) - verify via Supabase API
-        
-        Args:
-            token: The JWT token to verify
-        
-        Returns:
-            Tuple of (is_valid, payload_or_error)
+        Verify a Supabase JWT token and return its payload.
+
+        Tries local HS256 verification first (fast, no network call).
+        Falls back to Supabase API verification for other algorithms or
+        when SUPABASE_JWT_SECRET is not configured.
         """
-        # First, decode header to check algorithm without verification
-        try:
-            header = jwt.get_unverified_header(token)
-            alg = header.get('alg', 'HS256')
-            logger.debug(f"JWT algorithm: {alg}")
-            
-            # If it's HS256 and we have a secret, try local verification
-            if alg == 'HS256' and self.jwt_secret and len(self.jwt_secret) > 10:
-                try:
+        # Attempt fast local verification if secret is available
+        if self.jwt_secret:
+            try:
+                header = jwt.get_unverified_header(token)
+                if header.get("alg") == "HS256":
                     payload = jwt.decode(
                         token,
                         self.jwt_secret,
-                        algorithms=['HS256'],
-                        audience='authenticated'
+                        algorithms=["HS256"],
+                        audience="authenticated",
                     )
                     return True, payload
-                except jwt.InvalidTokenError:
-                    # Fall through to API verification
-                    pass
-            
-            # For ES256, RS256, or if local verification failed, use Supabase API
-            # ES256/RS256 require public keys which we get from Supabase
-        except Exception:
-            # If we can't decode header, try API verification anyway
-            pass
-        
-        # Verify by calling Supabase user endpoint (works for all token types)
+            except jwt.ExpiredSignatureError:
+                return False, {"error": "Token has expired"}
+            except jwt.InvalidTokenError:
+                pass  # fall through to API verification
+
+        # API-based verification (works for all algorithms)
+        return self._verify_via_api(token)
+
+    def _verify_via_api(self, token: str) -> Tuple[bool, Dict]:
         try:
-            headers = {
-                'Authorization': f'Bearer {token}',
-                'apikey': self.anon_key
-            }
-            
-            logger.debug(f"Verifying token via Supabase API: {self.auth_url}/user")
-            
             response = requests.get(
                 f"{self.auth_url}/user",
-                headers=headers,
-                timeout=10
+                headers={"Authorization": f"Bearer {token}", "apikey": self.anon_key},
+                timeout=10,
             )
-            
-            logger.debug(f"Supabase API response: {response.status_code}")
-            
             if response.status_code == 200:
                 return True, response.json()
             elif response.status_code == 401:
-                error_data = response.json() if response.text else {'message': 'Unknown error'}
-                return False, {'error': f"Token invalid: {error_data.get('message', 'Unauthorized')}"}
+                msg = response.json().get("message", "Unauthorized") if response.text else "Unauthorized"
+                return False, {"error": f"Token invalid: {msg}"}
             else:
-                return False, {'error': f"Verification failed: {response.status_code}", 'details': response.text[:200]}
-        
+                return False, {"error": f"Verification failed ({response.status_code})"}
         except requests.exceptions.Timeout:
-            return False, {'error': 'Verification request timed out'}
-        except requests.exceptions.RequestException as e:
-            return False, {'error': f'Verification failed: {str(e)}'}
-        except Exception as e:
-            return False, {'error': f'Unexpected error: {str(e)}'}
-    
-    def get_user(self, token: str) -> Tuple[bool, Dict]:
+            return False, {"error": "Supabase verification timed out"}
+        except requests.exceptions.RequestException as exc:
+            return False, {"error": f"Supabase request failed: {exc}"}
+
+    # ------------------------------------------------------------------ #
+    # Auth operations                                                        #
+    # ------------------------------------------------------------------ #
+
+    def sign_up(self, email: str, password: str, user_metadata: Dict = None) -> Tuple[bool, Dict]:
         """
-        Get user information from Supabase.
-        
-        Args:
-            token: The JWT token
-        
-        Returns:
-            Tuple of (success, user_data_or_error)
+        Register a new user. Supabase sends a confirmation email.
+        Returns (True, user_data) or (False, error_dict).
         """
+        body = {"email": email, "password": password}
+        if user_metadata:
+            body["data"] = user_metadata  # Supabase v2 uses 'data' for user_metadata on sign-up
+
         try:
-            headers = {
-                'Authorization': f'Bearer {token}',
-                'apikey': self.anon_key
-            }
-            
-            response = requests.get(
-                f"{self.auth_url}/user",
-                headers=headers,
-                timeout=10
-            )
-            
-            if response.status_code == 200:
-                return True, response.json()
-            else:
-                return False, {'error': response.text}
-        
-        except Exception as e:
-            return False, {'error': str(e)}
-    
-    def refresh_session(self, refresh_token: str) -> Tuple[bool, Dict]:
-        """
-        Refresh an access token using a refresh token.
-        
-        Args:
-            refresh_token: The refresh token
-        
-        Returns:
-            Tuple of (success, session_data_or_error)
-        """
-        try:
-            headers = {
-                'apikey': self.anon_key,
-                'Content-Type': 'application/json'
-            }
-            
             response = requests.post(
-                f"{self.auth_url}/token?grant_type=refresh_token",
-                headers=headers,
-                json={'refresh_token': refresh_token},
-                timeout=10
+                f"{self.auth_url}/signup",
+                headers={"apikey": self.anon_key, "Content-Type": "application/json"},
+                json=body,
+                timeout=10,
             )
-            
-            if response.status_code == 200:
-                return True, response.json()
-            else:
-                return False, {'error': response.text}
-        
-        except Exception as e:
-            return False, {'error': str(e)}
-    
-    def admin_create_user(self, email: str, password: str, 
-                          user_metadata: Dict = None) -> Tuple[bool, Dict]:
-        """
-        Create a user using the service role key (admin only).
-        
-        Args:
-            email: User's email
-            password: User's password
-            user_metadata: Additional user metadata
-        
-        Returns:
-            Tuple of (success, user_data_or_error)
-        """
-        try:
-            headers = {
-                'Authorization': f'Bearer {self.service_key}',
-                'apikey': self.anon_key,
-                'Content-Type': 'application/json'
-            }
-            
-            data = {
-                'email': email,
-                'password': password,
-                'email_confirm': True
-            }
-            
-            if user_metadata:
-                data['user_metadata'] = user_metadata
-            
-            response = requests.post(
-                f"{self.auth_url}/admin/users",
-                headers=headers,
-                json=data,
-                timeout=10
-            )
-            
-            if response.status_code in [200, 201]:
-                return True, response.json()
-            else:
-                return False, {'error': response.text}
-        
-        except Exception as e:
-            return False, {'error': str(e)}
-    
-    def admin_delete_user(self, user_id: str) -> Tuple[bool, Dict]:
-        """
-        Delete a user using the service role key (admin only).
-        
-        Args:
-            user_id: The user's UUID
-        
-        Returns:
-            Tuple of (success, result_or_error)
-        """
-        try:
-            headers = {
-                'Authorization': f'Bearer {self.service_key}',
-                'apikey': self.anon_key
-            }
-            
-            response = requests.delete(
-                f"{self.auth_url}/admin/users/{user_id}",
-                headers=headers,
-                timeout=10
-            )
-            
-            if response.status_code == 200:
-                return True, {'message': 'User deleted'}
-            else:
-                return False, {'error': response.text}
-        
-        except Exception as e:
-            return False, {'error': str(e)}
-    
+            data = response.json() if response.text else {}
+            if response.status_code in (200, 201):
+                return True, data
+            error_msg = data.get("msg") or data.get("message") or data.get("error_description") or "Registration failed"
+            return False, {"error": error_msg}
+        except requests.exceptions.RequestException as exc:
+            return False, {"error": str(exc)}
+
     def sign_in_with_password(self, email: str, password: str) -> Tuple[bool, Dict]:
         """
-        Sign in a user with email and password.
-        This is used server-side for testing/admin purposes.
-        Client apps should use Supabase client directly.
-        
-        Args:
-            email: User's email
-            password: User's password
-        
-        Returns:
-            Tuple of (success, session_data_or_error)
+        Sign in with email + password.
+        Returns Supabase session: { access_token, refresh_token, expires_in, user }.
         """
         try:
-            headers = {
-                'apikey': self.anon_key,
-                'Content-Type': 'application/json'
-            }
-            
             response = requests.post(
                 f"{self.auth_url}/token?grant_type=password",
-                headers=headers,
-                json={'email': email, 'password': password},
-                timeout=10
+                headers={"apikey": self.anon_key, "Content-Type": "application/json"},
+                json={"email": email, "password": password},
+                timeout=10,
             )
-            
+            data = response.json() if response.text else {}
             if response.status_code == 200:
-                return True, response.json()
-            else:
-                return False, {'error': response.text}
-        
-        except Exception as e:
-            return False, {'error': str(e)}
+                return True, data
+            error_msg = data.get("error_description") or data.get("msg") or data.get("message") or "Login failed"
+            return False, {"error": error_msg}
+        except requests.exceptions.RequestException as exc:
+            return False, {"error": str(exc)}
+
+    def sign_out(self, access_token: str) -> bool:
+        """
+        Invalidate the user's session on Supabase.
+        Returns True on success (or if token is already invalid).
+        """
+        try:
+            requests.post(
+                f"{self.auth_url}/logout",
+                headers={"Authorization": f"Bearer {access_token}", "apikey": self.anon_key},
+                timeout=10,
+            )
+        except requests.exceptions.RequestException:
+            pass  # Best-effort; client will discard token regardless
+        return True
+
+    def refresh_session(self, refresh_token: str) -> Tuple[bool, Dict]:
+        """Exchange a refresh token for a new access token."""
+        try:
+            response = requests.post(
+                f"{self.auth_url}/token?grant_type=refresh_token",
+                headers={"apikey": self.anon_key, "Content-Type": "application/json"},
+                json={"refresh_token": refresh_token},
+                timeout=10,
+            )
+            data = response.json() if response.text else {}
+            if response.status_code == 200:
+                return True, data
+            error_msg = data.get("error_description") or data.get("msg") or "Refresh failed"
+            return False, {"error": error_msg}
+        except requests.exceptions.RequestException as exc:
+            return False, {"error": str(exc)}
+
+    def send_password_reset(self, email: str, redirect_url: str = None) -> Tuple[bool, Dict]:
+        """Trigger Supabase password-reset email."""
+        body = {"email": email}
+        if redirect_url:
+            body["redirect_to"] = redirect_url
+        try:
+            response = requests.post(
+                f"{self.auth_url}/recover",
+                headers={"apikey": self.anon_key, "Content-Type": "application/json"},
+                json=body,
+                timeout=10,
+            )
+            if response.status_code in (200, 204):
+                return True, {}
+            return False, {"error": "Failed to send reset email"}
+        except requests.exceptions.RequestException as exc:
+            return False, {"error": str(exc)}
+
+    def admin_create_user(self, email: str, password: str, user_metadata: Dict = None, email_confirm: bool = True) -> Tuple[bool, Dict]:
+        """Create a user via service role (bypasses email confirmation)."""
+        body = {"email": email, "password": password, "email_confirm": email_confirm}
+        if user_metadata:
+            body["user_metadata"] = user_metadata
+        try:
+            response = requests.post(
+                f"{self.auth_url}/admin/users",
+                headers={
+                    "Authorization": f"Bearer {self.service_key}",
+                    "apikey": self.anon_key,
+                    "Content-Type": "application/json",
+                },
+                json=body,
+                timeout=10,
+            )
+            data = response.json() if response.text else {}
+            if response.status_code in (200, 201):
+                return True, data
+            return False, {"error": data.get("msg") or data.get("message") or "Admin create failed"}
+        except requests.exceptions.RequestException as exc:
+            return False, {"error": str(exc)}
 
 
-# Global instance
+# Module-level singleton
 supabase_auth = SupabaseAuth()

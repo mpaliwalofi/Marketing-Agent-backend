@@ -8,10 +8,10 @@ def home_view(request):
 
 
 urlpatterns = [
-    path('admin/', admin.site.urls),
-    path('api/auth/', include('apps.auth_app.urls')),
-    path('api/waitlist/', include('apps.waitlist.urls')),
-    path('api/chat/', include('apps.chatbot.urls')),
-    path('api/tenants/', include('apps.tenants.urls')),
-    path('', home_view),
+    path("admin/", admin.site.urls),
+    path("api/auth/", include("apps.auth_app.urls")),
+    path("api/agents/", include("apps.tenants.urls")),
+    path("api/waitlist/", include("apps.waitlist.urls")),
+    path("api/chat/", include("apps.chatbot.urls")),
+    path("", home_view),
 ]
